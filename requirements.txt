@@ -1,0 +1,8 @@
+# Runtime dependencies for pywzbankapi
+# Keep in sync with setup.py install_requires
+requests>=2.31
+loguru>=0.7
+
+# Optional: choose a GM/SM crypto backend and install separately, e.g.
+# gmssl  (if your environment uses gmssl)
+# cryptography + custom SM2/SM4 binding (if available in your org)
