@@ -10,6 +10,7 @@
 注意：本 README 先行定义了 API 设计、使用方式与安全约定，便于后续落地开发。实现会严格遵循本文档的接口与参数约定。
 
 **目录**
+
 - 快速开始
 - 安全与报文规范
 - 客户端初始化与配置
@@ -20,11 +21,13 @@
 - 变更记录（对应行方 v2.8）
 
 **快速开始**
+
 - 安装（预留）
   - pip 安装（发布后可用）：`pip install pywzbankapi`
   - 源码安装：在仓库根目录执行 `pip install -e .`
 
 示例
+
 ```python
 from pywzbankapi import WZBankClient
 
@@ -45,6 +48,7 @@ print(resp)
 ```
 
 **安全与报文规范**
+
 - 协议与地址
   - 所有请求使用 HTTPS，网关为 `https://openapi.wzbank.cn/prdApiGW/`
   - 资源路径遵循：版本号/服务分类/场景编号/接口名称（如：`/V1/P01502/S01/queryeaccountbalance`）
@@ -62,6 +66,7 @@ print(resp)
   - 可传 `x-aob-interaction-id` 追踪调用链路（UUID）
 
 **客户端初始化与配置**
+
 ```python
 from pywzbankapi import WZBankClient, CryptoProvider
 
@@ -83,6 +88,7 @@ client = WZBankClient(
 ```
 
 **通用请求参数与响应**
+
 - 请求体公共字段（置于被加密 JSON 内）
   - `mesgId` 请求流水号（建议 UUID）
   - `mesgDate` 请求日期（YYYYMMDD）
@@ -96,18 +102,22 @@ client = WZBankClient(
 **API 一览与示例（v2.8）**
 以下方法均自动处理：SM4 加密/解密、SM2 加签/验签、请求头与 `bizContent` 封装。示例仅展示必输字段，其他字段见方法 docstring。
 
-1) 账户余额查询
+1. 账户余额查询
+
 - 方法：`client.query_account_balance(payAcctNo)`
 - 路径：`/V1/P01502/S01/queryeaccountbalance`
+
 ```python
 resp = client.query_account_balance(payAcctNo="1234567890123456")
 # 返回：payAcctBal, curCode, curType, startDate, endDate, otherInfo, payAcctNo, payAcctUseBal
 ```
 
-2) 单笔转账
+2. 单笔转账
+
 - 方法：`client.single_transfer(...)`
 - 路径：`/V1/P01506/S01/singletrans`
 - 必输：`payAcctNo, transAmt, payAcctName, rcvAcctNo, rcvAcctName, inbankno, curCode=1, curType=0, orderNo, reserve2`
+
 ```python
 resp = client.single_transfer(
     payAcctNo="付款账号",
@@ -123,9 +133,11 @@ resp = client.single_transfer(
 # 返回：orderNo, bankSeqNo, workdate
 ```
 
-3) 单笔转账结果查询
+3. 单笔转账结果查询
+
 - 方法：`client.query_single_transfer_result(...)`
 - 路径：`/V1/P01507/S01/selsingletrans`
+
 ```python
 resp = client.query_single_transfer_result(
     busCode="1",            # 1-按流水号, 2-按订单号
@@ -137,9 +149,11 @@ resp = client.query_single_transfer_result(
 # 返回：dealStatus(0/1/2), setDate, bankSeqNo, transAmt, payAcctNo, rcvAcctNo, orderNo, failedReason
 ```
 
-4) 批量转账
+4. 批量转账
+
 - 方法：`client.batch_transfer(...)`
 - 路径：`/V1/P01508/S01/batchtrans`
+
 ```python
 resp = client.batch_transfer(
     transDate="YYYY-MM-DD",
@@ -163,26 +177,32 @@ resp = client.batch_transfer(
 # 返回体为空（以查询接口获取结果）
 ```
 
-5) 批量转账结果查询
+5. 批量转账结果查询
+
 - 方法：`client.query_batch_transfer_result(payAcctNo, batchNo)`
 - 路径：`/V1/P01509/S01/selbatchtrans`
 
-6) 时间段明细查询申请
+6. 时间段明细查询申请
+
 - 方法：`client.query_hour_details(payAcctNo, startDate, endDate)`
 - 路径：`/V1/P01512/S01/queryhourdetails`
 
-7) 账务明细回单下载
+7. 账务明细回单下载
+
 - 方法：`client.download_details_receipt(acctNo, transDate, transSeqno, transOperNo=None, transBrno=None)`
 - 路径：`/V1/P01513/S01/detailsreceipt`
 
-8) 银企直连对账（文件下载 URL）
+8. 银企直连对账（文件下载 URL）
+
 - 方法：`client.check_account(payAcctNo, startDate, endDate)`
 - 路径：`/V1/P01518/S01/checkAcct`
 - 返回：`fileUrl`（浏览器直接 GET 即可下载）
 
-9) 对账结果更新
+9. 对账结果更新
+
 - 方法：`client.update_check_result(payAcctNo, checkUser, billNo, billList)`
 - 路径：`/V1/P01519/S01/checkResultUpdate`
+
 ```python
 resp = client.update_check_result(
     payAcctNo="账号",
@@ -200,33 +220,40 @@ resp = client.update_check_result(
 )
 ```
 
-10) 子账户余额查询
+10. 子账户余额查询
+
 - 方法：`client.query_subacct_balance(payAcctNo)`
 - 路径：`/V1/P01520/S01/queryeSubacctBalance`
 
-11) 交易明细查询（流水号匹配）
+11. 交易明细查询（流水号匹配）
+
 - 方法：`client.query_hour_details2(payAcctNo, startDate, endDate)`
 - 路径：`/V1/P01522/S01/queryhourdetails2`
 
-12) 收单明细查询
+12. 收单明细查询
+
 - 方法：`client.query_receipt_details(payAcctNo, startDate, endDate, merId, miniTransAmt=None, maxTransAmt=None)`
 - 路径：`/V1/P01523/S01/queryreceiptdetails`
 
-13) 行名行号查询（v2.8 新增）
+13. 行名行号查询（v2.8 新增）
+
 - 方法：`client.query_bank_infos(type, bankName=None, bankNo=None)`
 - 路径：`/V1/P01524/S01/querybankinfos`
 - 规则：`type=0` 时需传 `bankName`；`type=1` 时需传 `bankNo`
 
-14) 证书有效期查询
+14. 证书有效期查询
+
 - 方法：`client.query_cert_expiry(payAcctNo)`
 - 路径：`/V1/P01525/S01/queryCertExpiry`
 
 **错误处理与重试**
+
 - SDK 将对非 2xx HTTP 状态、验签失败、解密失败抛出显式异常
 - 业务返回（解密后）需检查 `dealCode` 与 `dealMsg`
 - 可配置自动重试策略（如网络抖动、5xx）与幂等键 `x-idempotency-key`
 
 **常见问题（FAQ）**
+
 - 如何准备国密证书材料？
   - 从行方获取/对接：用于验签的银行 SM2 公钥；用于加签的企业 SM2 私钥；SM4 对称密钥与 IV（16 字节）
 - Python 如何完成 SM2/SM4？
@@ -235,13 +262,22 @@ resp = client.update_check_result(
   - `checkAcct` 返回 `fileUrl`，可直接 `requests.get(fileUrl)` 下载。
 
 **变更记录（对应行方 v2.8 摘要）**
+
 - V2.7：收单明细查询商户号描述调整；余额查询新增 `payAcctUseBal`
 - V2.8：新增行名行号查询 `/V1/P01524/S01/querybankinfos`
 
 **致谢**
+
 - 文档属性：开放平台接口说明（银企直连），版本号 v2.8，提交 2024-12-10
 - 撰写：林建海；审核：金值
 
 **免责声明**
 本 SDK 为对接辅助工具。实际生产接入需与行方测试环境联调，确保证书、算法参数、签名/验签、加解密与业务字段完全匹配行方规范。
 
+### 测试环境域名地址：
+
+https://zhihuitest.wzbank.cn/indApp/apiGateway
+
+### 生产环境域名地址：
+
+https://openapi.wzbank.cn/prdApiGW
