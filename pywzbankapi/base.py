@@ -1,368 +1,556 @@
-from __future__ import annotations
-
+from datetime import datetime
 import json
-from typing import Any, Dict, Optional
-
+from uuid import uuid4
+import os
 import requests
 from loguru import logger
+from .generate_signature import (
+    encrypt_biz_content,
+    build_sign_map,
+    sign_payload,
+    decrypt_biz_content,
+)
 
 
-class WZBankError(Exception):
-    """Base exception for WZBank client errors."""
+def get_mesg_id():
+    return str(uuid4()).replace("-", "")[:32]
 
 
-class HTTPError(WZBankError):
-    """Raised when HTTP status is not 2xx."""
-
-    def __init__(self, status_code: int, body: Optional[str] = None):
-        super().__init__(f"HTTP {status_code}: {body}")
-        self.status_code = status_code
-        self.body = body
+def get_mesg_date():
+    return datetime.now().strftime("%Y%m%d")
 
 
-class SignatureError(WZBankError):
-    """Raised when response signature verification fails."""
+def get_mesg_time():
+    return datetime.now().strftime("%H%M%S000")
 
 
-class DecryptError(WZBankError):
-    """Raised when response bizContent decryption fails."""
+class Base:
 
+    def __init__(self, debug=False):
 
-class CryptoProvider:
-    """Abstraction of SM2/SM4 operations used by the client.
+        private_key = "bf5e4387c88b536c203d3893a2f7fceeb2badcb6eb9e1e331197caf9372a335e"
 
-    Provide concrete implementations that conform to these methods.
+        test_host = "https://zhihuitest.wzbank.cn/indApp/apiGateway"
+        prod_host = "https://openapi.wzbank.cn/prdApiGW"
 
-    Expected behaviors:
-    - sign(data) -> returns signature text (DER hex or base64 as required by bank)
-    - verify(data, signature) -> returns True if signature matches
-    - encrypt(plaintext) -> returns hex string of SM4-encrypted ciphertext
-    - decrypt(cipher_hex) -> returns plaintext bytes
+        self.host = test_host if debug else prod_host
+        self.privateKey = private_key
+        self.SM4Key = bytes.fromhex("2ABDBED2A873B983148F922CFA238205")
+        self.SM4Iv = bytes.fromhex("F336C87E2373A3C792E59DBF23771BCD")
 
-    Note: Banks may require a specific JSON canonicalization for signing. This
-    SDK builds the signature payload in a deterministic way; adapt verify/sign
-    to match bank-side expectations if needed.
-    """
+        self.appId = "bb800191-782c-41bc-920e-62f396008264"
 
-    def __init__(
+    def request(
         self,
-        sm2_private_key_pem: Optional[str] = None,
-        sm2_bank_public_key_pem: Optional[str] = None,
-        sm4_key_hex: Optional[str] = None,
-        sm4_iv_hex: Optional[str] = None,
-    ) -> None:
-        self.sm2_private_key_pem = sm2_private_key_pem
-        self.sm2_bank_public_key_pem = sm2_bank_public_key_pem
-        self.sm4_key_hex = sm4_key_hex
-        self.sm4_iv_hex = sm4_iv_hex
+        endpoint: str,
+        headers: dict,
+        json_data: dict,
+        method: str = "POST",
+    ):
+        url = f"{self.host}{endpoint}"
+        headers = {
+            "x-aob-appID": self.appId,
+            "x-aob-bankID": "WZB",
+            **headers,
+        }
 
-    # --- SM2 ---
-    def sign(self, data: bytes) -> str:
-        raise NotImplementedError("Provide SM2 sign implementation")
+        json_data = {
+            **json_data,
+            "mesgId": get_mesg_id(),
+            "mesgDate": get_mesg_date(),
+            "mesgTime": get_mesg_time(),
+        }
+        logger.debug(
+            {
+                "msg": "请求信息",
+                "接口地址": url,
+                "请求头": headers,
+                "请求体（加密前）": json_data,
+            }
+        )
+        biz_content = encrypt_biz_content(json_data, self.SM4Key, self.SM4Iv)
+        logger.debug({"msg": "SM4加密请求体", "请求体（加密后）": biz_content})
+        sign_map = build_sign_map(headers, biz_content)
+        signature = sign_payload(sign_map, self.privateKey)
+        logger.debug({"msg": "请求签名", "sign": signature, "长度": len(signature)})
+        headers["x-aob-signature"] = signature
+        logger.debug({"msg": "请求完整内容", "headers": headers, "json": biz_content})
+        response = requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            json=biz_content,
+        )
+        return self.response(response)
 
-    def verify(self, data: bytes, signature: str) -> bool:
-        raise NotImplementedError("Provide SM2 verify implementation")
-
-    # --- SM4 ---
-    def encrypt(self, plaintext: bytes) -> str:
-        raise NotImplementedError("Provide SM4 encrypt implementation (return hex string)")
-
-    def decrypt(self, cipher_hex: str) -> bytes:
-        raise NotImplementedError("Provide SM4 decrypt implementation (accept hex string)")
-
-
-class WZBankClient:
-    """Wenzhou Bank Open Platform client (银企直连).
-
-    Handles:
-    - Biz JSON SM4 encryption into bizContent hex
-    - SM2 signing of header+body canonical payload
-    - HTTP POST and response parsing
-    - Optional response signature verification and bizContent decryption
-    """
-
-    def __init__(
-        self,
-        app_id: str,
-        bank_id: str = "WZB",
-        base_url: str = "https://openapi.wzbank.cn/prdApiGW/",
-        crypto: Optional[CryptoProvider] = None,
-        sm2_private_key_pem: Optional[str] = None,
-        sm2_bank_public_key_pem: Optional[str] = None,
-        sm4_key_hex: Optional[str] = None,
-        sm4_iv_hex: Optional[str] = None,
-        timeout: int = 30,
-        debug: bool = False,
-    ) -> None:
-        self.app_id = app_id
-        self.bank_id = bank_id
-        self.base_url = base_url.rstrip("/") + "/"
-        self.timeout = timeout
-        self.debug = debug
-
-        if crypto is None:
-            crypto = CryptoProvider(
-                sm2_private_key_pem=sm2_private_key_pem,
-                sm2_bank_public_key_pem=sm2_bank_public_key_pem,
-                sm4_key_hex=sm4_key_hex,
-                sm4_iv_hex=sm4_iv_hex,
-            )
-        self.crypto = crypto
-
-        self.session = requests.Session()
-
-    # --- public high-level methods (endpoints can be built on top) ---
-    def post(
-        self,
-        path: str,
-        body: Dict[str, Any],
-        headers: Optional[Dict[str, str]] = None,
-        verify_response_signature: bool = True,
-    ) -> Dict[str, Any]:
-        """POST with required SM4/SM2 processing.
-
-        - path: e.g., "V1/P01502/S01/queryeaccountbalance" (with or without leading slash)
-        - body: dict of the clear JSON to encrypt as bizContent
-        - headers: extra headers to include
-        - verify_response_signature: verify bank signature if provided
-        """
-        if path.startswith("/"):
-            path = path[1:]
-        url = self.base_url + path
-
-        # 1) Encrypt body to bizContent hex
-        biz_hex = self._encrypt_body_to_biz(body)
-
-        # 2) Build signature over canonical payload
-        signature_payload = self._build_signature_payload(self.app_id, self.bank_id, biz_hex)
-        signature = self.crypto.sign(signature_payload)
-
-        # 3) Build headers and JSON body
-        req_headers = self._build_headers(signature, headers)
-        json_body = {"bizContent": biz_hex}
-
-        if self.debug:
-            logger.debug(
+    def response(self, response: requests.Response):
+        status_code = response.status_code
+        if status_code != 200:
+            logger.error(
                 {
-                    "url": url,
-                    "headers": {k: (v if k != "x-aob-signature" else "***masked***") for k, v in req_headers.items()},
-                    "body": json_body,
+                    "msg": "请求失败",
+                    "状态码": response.status_code,
+                    "响应头": dict(response.headers),
+                    "响应体": response.text,
                 }
             )
+            return
+        response_json = response.json()
+        biz_content_encrypted = response_json.get("bizContent", "")
+        logger.debug(
+            {"msg": "SM4加密响应体", "响应体（加密后）": biz_content_encrypted}
+        )
+        biz_content_decrypted = decrypt_biz_content(
+            biz_content_encrypted, self.SM4Key, self.SM4Iv
+        )
+        logger.debug(
+            {"msg": "SM4解密响应体", "响应体（解密后）": biz_content_decrypted}
+        )
+        return biz_content_decrypted
 
-        resp = self.session.post(url, headers=req_headers, json=json_body, timeout=self.timeout)
-        if not (200 <= resp.status_code < 300):
-            body_text = None
-            try:
-                body_text = resp.text
-            except Exception:
-                pass
-            raise HTTPError(resp.status_code, body_text)
-
-        # 4) Parse JSON body
-        try:
-            resp_json = resp.json()
-        except ValueError as e:
-            raise HTTPError(resp.status_code, f"Invalid JSON response: {resp.text}") from e
-
-        # 5) Optional verify response signature
-        bank_sig = resp.headers.get("x-aob-signature")
-        if verify_response_signature and bank_sig:
-            # Bank typically signs the response body. Use canonical JSON for verification.
-            response_payload = self._canonical_json_bytes({"bizContent": resp_json.get("bizContent")})
-            ok = False
-            try:
-                ok = self.crypto.verify(response_payload, bank_sig)
-            except NotImplementedError:
-                # If verify isn't implemented, skip but warn.
-                logger.warning(
-                    "CryptoProvider.verify not implemented; skipping response signature verification."
-                )
-                ok = True
-            if not ok:
-                raise SignatureError("Response signature verification failed")
-
-        # 6) Decrypt bizContent
-        biz_hex_resp = resp_json.get("bizContent")
-        if biz_hex_resp is None:
-            # Some endpoints might return raw JSON without encryption, but per spec it should be encrypted.
-            if self.debug:
-                logger.warning("No bizContent in response; returning original JSON body.")
-            return resp_json  # fallback
-
-        try:
-            plaintext = self.crypto.decrypt(biz_hex_resp)
-            data = json.loads(plaintext.decode("utf-8"))
-        except NotImplementedError:
-            raise DecryptError("CryptoProvider.decrypt not implemented; cannot decrypt bizContent")
-        except Exception as e:
-            raise DecryptError(f"Failed to decrypt/parse bizContent: {e}") from e
-
-        if self.debug:
-            logger.debug({"response": data})
-        return data
-
-    # --- convenience wrappers for documented endpoints (names mirror README) ---
-    def query_account_balance(self, payAcctNo: str, **common: Any) -> Dict[str, Any]:
-        """账户余额查询 (/V1/P01502/S01/queryeaccountbalance)
-
-        必输: payAcctNo(账号)
-        返回: payAcctBal, curCode, curType, startDate, endDate, otherInfo, payAcctNo, payAcctUseBal
+    def queryeaccountbalance(self, payAcctNo: str):
         """
-        if not payAcctNo:
-            raise WZBankError("payAcctNo is required")
-        body = {**self._common_body_defaults(), **common, "payAcctNo": payAcctNo}
-        return self.post("V1/P01502/S01/queryeaccountbalance", body)
-
-    def single_transfer(self, **kwargs: Any) -> Dict[str, Any]:
-        """单笔转账 (/V1/P01506/S01/singletrans)
-
-        必输: payAcctNo, transAmt, payAcctName, rcvAcctNo, rcvAcctName, inbankno,
-             curCode(默认'1'), curType(默认'0'), orderNo, reserve2
-        选填: inbankname, remark, reserve1
-        返回: orderNo, bankSeqNo, workdate
+        3.1.	账户余额查询接口
         """
-        required = [
-            "payAcctNo",
-            "transAmt",
-            "payAcctName",
-            "rcvAcctNo",
-            "rcvAcctName",
-            "inbankno",
-            "orderNo",
-            "reserve2",
-        ]
-        data = {**self._common_body_defaults(), **kwargs}
-        for k in required:
-            if not data.get(k):
-                raise WZBankError(f"{k} is required")
-        if "curCode" not in data or data.get("curCode") in (None, ""):
-            data["curCode"] = "1"
-        if "curType" not in data or data.get("curType") in (None, ""):
-            data["curType"] = "0"
-        body = data
-        return self.post("V1/P01506/S01/singletrans", body)
+        endpoint = "/V1/P01502/S01/queryeaccountbalance"
+        data = {
+            "payAcctNo": payAcctNo,
+        }
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
 
-    def query_single_transfer_result(self, **kwargs: Any) -> Dict[str, Any]:
-        body = {**self._common_body_defaults(), **kwargs}
-        return self.post("V1/P01507/S01/selsingletrans", body)
+    def singletrans(
+        self,
+        payAcctNo: str,
+        transAmt: str,
+        payAcctName: str,
+        rcvAcctNo: str,
+        rcvAcctName: str,
+        orderNo: str,
+        inbankno: str,
+        inbankname: str | None = None,
+        curCode: str = "1",
+        curType: str = "0",
+        remark: str | None = None,
+    ):
+        """
+        3.2.	银企直连单笔转账交易
+        payAcctNo	Max32Text	付款账号	是	银企直连签约账号
+        transAmt	Max32Text	交易金额	是	保留小数点后两位
+        payAcctName	Max64Text	付款账号名称	是
+        rcvAcctNo	Max32Text	收款账号	是
+        rcvAcctName	Max64Text	收款户名	是
+        inbankname	Max30Text	 入账总银行名称	否
+        inbankno	Max30Text	 入账总银行行号	是
+        curCode	Max1Text	交易货币代码	是	默认传1
+        curType	Max1Text	钞汇类别	是	默认传0
+        remark	Max64Text	摘要	否
+        orderNo	Max30Text	发起方唯一业务标识	是
 
-    def batch_transfer(self, **kwargs: Any) -> Dict[str, Any]:
-        body = {**self._common_body_defaults(), **kwargs}
-        return self.post("V1/P01508/S01/batchtrans", body)
+        """
+        endpoint = "/V1/P01506/S01/singletrans"
+        data = {
+            "payAcctNo": payAcctNo,
+            "transAmt": transAmt,
+            "payAcctName": payAcctName,
+            "rcvAcctNo": rcvAcctNo,
+            "rcvAcctName": rcvAcctName,
+            "orderNo": orderNo,
+            "inbankno": inbankno,
+            "curCode": curCode,
+            "curType": curType,
+        }
+        if remark:
+            data["remark"] = remark
+        if inbankname:
+            data["inbankname"] = inbankname
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
 
-    def query_batch_transfer_result(
-        self, payAcctNo: str, batchNo: str, **common: Any
-    ) -> Dict[str, Any]:
-        body = {**self._common_body_defaults(), **common, "payAcctNo": payAcctNo, "batchNo": batchNo}
-        return self.post("V1/P01509/S01/selbatchtrans", body)
+    def selsingletrans(
+        self,
+        busCode: str,
+        payAcctNo: str,
+        startDate: str,
+        bankSeqNo: str | None = None,
+        orderNo: str | None = None,
+    ):
+        """
+        3.3.	银企直连单笔转账结果查询交易
+        busCode	Max1Text	功能码	是	1：通过交易流水查询 2：通过订单号查询
+        payAcctNo	Max32Text	付款账号	是
+        startDate	Max11Text	查询日期	是
+        bankSeqNo	Max32Text	流水号	否	根据功能码选择上传对应字段
+        orderNo	Max30Text	订单号	否	根据功能码选择上传对应字段
+        """
+        endpoint = "/V1/P01507/S01/selsingletrans"
+        if busCode == "1" and not bankSeqNo:
+            raise ValueError("busCode为1时，bankSeqNo不能为空")
+        if busCode == "2" and not orderNo:
+            raise ValueError("busCode为2时，orderNo不能为空")
+        data = {
+            "busCode": busCode,
+            "payAcctNo": payAcctNo,
+            "startDate": startDate,
+        }
+        if bankSeqNo:
+            data["bankSeqNo"] = bankSeqNo
+        if orderNo:
+            data["orderNo"] = orderNo
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
 
-    def query_hour_details(
-        self, payAcctNo: str, startDate: str, endDate: str, **common: Any
-    ) -> Dict[str, Any]:
-        body = {
-            **self._common_body_defaults(),
-            **common,
+    def batchtrans(
+        self,
+    ):
+        """
+        todo:业务上暂时不用
+        3.4.	银企直连批量转账交易
+        transDate	Max11Text	交易日期	是
+        orderNo	Max30Text	发起方唯一业务标识	是
+        payAcctName	Max200Text	付款账号户名	是
+        payAcctNo	Max32Text	付款账号	是
+        batchNo	Max257Text	批量转账批次号	是
+        sumAmt	Max32Text	交易总金额	是
+        totalCnt	Max10Text	总数量	是
+        dcFlag	Max2Text	转账方式	是	  1：汇总入账 2：单笔入账 --固定为2
+        transList循环
+        rcvAcctNo	Max10Text 	收款账号	否
+        rcvAcctSeqno	Max40Text 	收款账户序号	否
+        rcvAcctName	Max80Text 	收款户名	否
+        revCertNo	Max10Text 	收款人证件号码	否
+        inbankname	Max40Text 	 入账总银行名称	否
+        inbankno	Max10Text 	 入账总银行行号	否
+        transAmt	Max12Text 	转账金额	否
+        busCode	Max12Text 	转账方式	否	1.行内转账 8.超网
+        remark	Max12Text 	摘要	否
+        reserve1	Max20Text	预留字段1	否
+        reserve2	Max80Text	预留字段2	否
+        """
+        endpoint = "/V1/P01508/S01/batchtrans"
+        data = {}
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
+
+    def selbatchtrans(
+        self,
+        payAcctNo: str,
+        batchNo: str,
+    ):
+        """
+        todo:业务上暂时不用
+        3.5.	银企直连批量转账结果查询交易
+        payAcctNo	Max32Text	付款账号	是
+        batchNo	Max257Text	批量转账批次号	是
+        """
+        endpoint = "/V1/P01509/S01/selbatchtrans"
+        data = {
+            "payAcctNo": payAcctNo,
+            "batchNo": batchNo,
+        }
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
+
+    def queryhourdetails(
+        self,
+        payAcctNo: str,
+        startDate: str,
+        endDate: str,
+    ):
+        """
+        3.6.	银企直连时间段明细查询申请
+        payAcctNo	Max32Text	付款账号	是
+        startDate	Max30Text	起始日期	是	yyyyMMddhhmmss例：20221001140000
+        endDate	Max30Text	结束日期	是	yyyyMMddhhmmss
+        """
+        endpoint = "/V1/P01512/S01/queryhourdetails"
+        data = {
             "payAcctNo": payAcctNo,
             "startDate": startDate,
             "endDate": endDate,
         }
-        return self.post("V1/P01512/S01/queryhourdetails", body)
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
 
-    def download_details_receipt(
+    def detailsreceipt(
         self,
         acctNo: str,
         transDate: str,
         transSeqno: str,
-        transOperNo: Optional[str] = None,
-        transBrno: Optional[str] = None,
-        **common: Any,
-    ) -> Dict[str, Any]:
-        body = {
-            **self._common_body_defaults(),
-            **common,
+        transOperNo: str | None = None,
+        transBrno: str | None = None,
+    ):
+        """
+        3.7.	银企直连账务明细回单下载
+        acctNo	Max32Text	银企直连签约账号	是
+        transDate	Max30Text	交易日期	是	P01512返回字段
+        transSeqno	Max30Text	核心流水号	是	P01512返回字段
+        transOperNo	Max30Text	交易柜员	否	P01512返回字段
+        transBrno	Max15Text	交易机构	否	P01512返回字段
+        """
+        endpoint = "/V1/P01513/S01/detailsreceipt"
+        # 必填校验
+        if not acctNo:
+            raise ValueError("acctNo 不能为空")
+        if not transDate:
+            raise ValueError("transDate 不能为空")
+        if not transSeqno:
+            raise ValueError("transSeqno 不能为空")
+
+        data = {
             "acctNo": acctNo,
             "transDate": transDate,
             "transSeqno": transSeqno,
         }
-        if transOperNo is not None:
-            body["transOperNo"] = transOperNo
-        if transBrno is not None:
-            body["transBrno"] = transBrno
-        return self.post("V1/P01513/S01/detailsreceipt", body)
+        if transOperNo:
+            data["transOperNo"] = transOperNo
+        if transBrno:
+            data["transBrno"] = transBrno
 
-    def check_account(self, payAcctNo: str, startDate: str, endDate: str, **common: Any) -> Dict[str, Any]:
-        body = {**self._common_body_defaults(), **common, "payAcctNo": payAcctNo, "startDate": startDate, "endDate": endDate}
-        return self.post("V1/P01518/S01/checkAcct", body)
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
 
-    def update_check_result(self, **kwargs: Any) -> Dict[str, Any]:
-        body = {**self._common_body_defaults(), **kwargs}
-        return self.post("V1/P01519/S01/checkResultUpdate", body)
+    def checkacct(
+        self,
+        payAcctNo: str,
+        startDate: str,
+        endDate: str,
+    ):
+        """
+        3.8. 银企直连对账 - 对账文件下载
+        payAcctNo Max32Text 银企直连签约账号 是
+        startDate Max8Text 开始日期 是 yyyyMMdd
+        endDate   Max8Text 结束日期 是 yyyyMMdd
+        """
+        endpoint = "/V1/P01518/S01/checkAcct"
+        if not payAcctNo:
+            raise ValueError("payAcctNo 不能为空")
+        if not startDate:
+            raise ValueError("startDate 不能为空")
+        if not endDate:
+            raise ValueError("endDate 不能为空")
 
-    def query_subacct_balance(self, payAcctNo: str, **common: Any) -> Dict[str, Any]:
-        body = {**self._common_body_defaults(), **common, "payAcctNo": payAcctNo}
-        return self.post("V1/P01520/S01/queryeSubacctBalance", body)
-
-    def query_hour_details2(self, payAcctNo: str, startDate: str, endDate: str, **common: Any) -> Dict[str, Any]:
-        body = {**self._common_body_defaults(), **common, "payAcctNo": payAcctNo, "startDate": startDate, "endDate": endDate}
-        return self.post("V1/P01522/S01/queryhourdetails2", body)
-
-    def query_receipt_details(self, **kwargs: Any) -> Dict[str, Any]:
-        body = {**self._common_body_defaults(), **kwargs}
-        return self.post("V1/P01523/S01/queryreceiptdetails", body)
-
-    def query_bank_infos(
-        self, type: str, bankName: Optional[str] = None, bankNo: Optional[str] = None, **common: Any
-    ) -> Dict[str, Any]:
-        body = {**self._common_body_defaults(), **common, "type": type}
-        if type == "0":
-            if not bankName:
-                raise WZBankError("type=0 requires bankName")
-            body["bankName"] = bankName
-        elif type == "1":
-            if not bankNo:
-                raise WZBankError("type=1 requires bankNo")
-            body["bankNo"] = bankNo
-        return self.post("V1/P01524/S01/querybankinfos", body)
-
-    def query_cert_expiry(self, payAcctNo: str, **common: Any) -> Dict[str, Any]:
-        body = {**self._common_body_defaults(), **common, "payAcctNo": payAcctNo}
-        return self.post("V1/P01525/S01/queryCertExpiry", body)
-
-    # --- internal helpers ---
-    def _common_body_defaults(self) -> Dict[str, Any]:
-        # Caller should supply real mesgId/mesgDate/mesgTime if needed.
-        return {}
-
-    def _encrypt_body_to_biz(self, body: Dict[str, Any]) -> str:
-        try:
-            plaintext = self._canonical_json_bytes(body)
-            return self.crypto.encrypt(plaintext)
-        except NotImplementedError:
-            raise DecryptError("CryptoProvider.encrypt not implemented; cannot encrypt request body")
-
-    def _build_signature_payload(self, app_id: str, bank_id: str, biz_hex: str) -> bytes:
-        # Keep key order as specified by the bank documentation.
-        payload = {
-            "x-aob-appID": app_id,
-            "x-aob-bankID": bank_id,
-            "bizContent": biz_hex,
+        data = {
+            "payAcctNo": payAcctNo,
+            "startDate": startDate,
+            "endDate": endDate,
         }
-        return self._canonical_json_bytes(payload)
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
 
-    def _build_headers(self, signature: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "x-aob-appID": self.app_id,
-            "x-aob-bankID": self.bank_id,
-            "x-aob-signature": signature,
+    def checkresultupdate(
+        self,
+        payAcctNo: str,
+        checkUser: str,
+        billNo: str,
+        billList: list[dict],
+    ):
+        """
+        3.9. 银企直连对账结果更新
+        payAcctNo: 银企直连签约账号 (必)
+        checkUser: 对账人 (必)
+        billNo: 账单编号 (必)
+        billList: 账单循环列表 (必) - 每项为 dict 包含 acctNo, acctType, replyStatus, ccy, acctList 等
+        """
+        endpoint = "/V1/P01519/S01/checkResultUpdate"
+        if not payAcctNo:
+            raise ValueError("payAcctNo 不能为空")
+        if not checkUser:
+            raise ValueError("checkUser 不能为空")
+        if not billNo:
+            raise ValueError("billNo 不能为空")
+        if not billList:
+            raise ValueError("billList 不能为空")
+
+        data = {
+            "payAcctNo": payAcctNo,
+            "checkUser": checkUser,
+            "billNo": billNo,
+            "billList": billList,
         }
-        if extra:
-            headers.update(extra)
-        return headers
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
 
-    @staticmethod
-    def _canonical_json_bytes(obj: Dict[str, Any]) -> bytes:
-        # Use separators to avoid spaces; keep insertion order for dict
-        return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    def queryesubacctbalance(self, payAcctNo: str):
+        """
+        3.10. 子账户余额查询接口
+        payAcctNo: 账号 (必)
+        """
+        endpoint = "/V1/P01520/S01/queryeSubacctBalance"
+        if not payAcctNo:
+            raise ValueError("payAcctNo 不能为空")
+
+        data = {"payAcctNo": payAcctNo}
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
+
+    def queryhourdetails2(
+        self,
+        payAcctNo: str,
+        startDate: str,
+        endDate: str,
+    ):
+        """
+        3.11. 交易明细查询（流水号匹配）
+        payAcctNo, startDate, endDate 必填，日期格式 yyyyMMddhhmmss
+        """
+        endpoint = "/V1/P01522/S01/queryhourdetails2"
+        if not payAcctNo:
+            raise ValueError("payAcctNo 不能为空")
+        if not startDate:
+            raise ValueError("startDate 不能为空")
+        if not endDate:
+            raise ValueError("endDate 不能为空")
+
+        data = {
+            "payAcctNo": payAcctNo,
+            "startDate": startDate,
+            "endDate": endDate,
+        }
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
+
+    def queryreceiptdetails(
+        self,
+        payAcctNo: str,
+        startDate: str,
+        endDate: str,
+        merId: str,
+        miniTransAmt: str | None = None,
+        maxTransAmt: str | None = None,
+    ):
+        """
+        3.12. 收单明细查询
+        payAcctNo, startDate, endDate, merId 必填
+        miniTransAmt, maxTransAmt 可选
+        """
+        endpoint = "/V1/P01523/S01/queryreceiptdetails"
+        if not payAcctNo:
+            raise ValueError("payAcctNo 不能为空")
+        if not startDate:
+            raise ValueError("startDate 不能为空")
+        if not endDate:
+            raise ValueError("endDate 不能为空")
+        if not merId:
+            raise ValueError("merId 不能为空")
+
+        data = {
+            "payAcctNo": payAcctNo,
+            "startDate": startDate,
+            "endDate": endDate,
+            "merId": merId,
+        }
+        if miniTransAmt is not None:
+            data["miniTransAmt"] = miniTransAmt
+        if maxTransAmt is not None:
+            data["maxTransAmt"] = maxTransAmt
+
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
+
+    def querybankinfos(
+        self, type: str, bankName: str | None = None, bankNo: str | None = None
+    ):
+        """
+        3.13. 行名行号查询
+        type: 查询类型 (必) '0' 行名查询行号 (需 bankName), '1' 行号查询行名 (需 bankNo)
+        """
+        endpoint = "/V1/P01524/S01/querybankinfos"
+        if not type:
+            raise ValueError("type 不能为空")
+        if type == "0" and not bankName:
+            raise ValueError("type 为 0 时，bankName 不能为空")
+        if type == "1" and not bankNo:
+            raise ValueError("type 为 1 时，bankNo 不能为空")
+
+        data = {"type": type}
+        if bankName:
+            data["bankName"] = bankName
+        if bankNo:
+            data["bankNo"] = bankNo
+
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
+
+    def querycertexpiry(self, payAcctNo: str):
+        """
+        3.14. 证书有效期查询接口
+        payAcctNo 必填
+        """
+        endpoint = "/V1/P01525/S01/queryCertExpiry"
+        if not payAcctNo:
+            raise ValueError("payAcctNo 不能为空")
+
+        data = {"payAcctNo": payAcctNo}
+        response = self.request(
+            endpoint=endpoint,
+            headers={},
+            json_data=data,
+            method="POST",
+        )
+        return response
